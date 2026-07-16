@@ -1,0 +1,455 @@
+import sys
+import time
+import select
+from gpiozero import OutputDevice
+
+# =============================================================
+# CONFIGURATION
+# =============================================================
+AIRBLOW_PIN = 18
+
+# Inayos para sa High-Level Trigger (Jumper sa H)
+# active_high=True -> Standard Logic (ON = HIGH, OFF = LOW)
+# initial_value=False -> Magsisimula ang pin sa LOW (0V) para siguradong OFF ang relay.
+AIRBLOW = OutputDevice(
+    AIRBLOW_PIN, 
+    active_high=True,      # High-level trigger relay module (Jumper sa H)
+    initial_value=False    # Magsisimula sa OFF state (Pin status: LOW / 0V)
+)
+
+# Siguraduhing OFF ang relay sa simula
+AIRBLOW.off()
+
+# Tugma sa High-Speed Tuning Zone ng orihinal mong code
+AIRBLOW_TRAVEL_DELAY = 0.0  # Delay bago bumuga ng hangin (seconds)
+AIRBLOW_DURATION = 0.8      # Tagal ng pagbuga ng hangin (seconds)
+
+# =============================================================
+# AIRBLOW FUNCTION
+# =============================================================
+def trigger_airblow(duration=0.8):
+    try:
+        if AIRBLOW_TRAVEL_DELAY > 0:
+            print(f"[DELAY] Waiting for {AIRBLOW_TRAVEL_DELAY}s travel delay...")
+            time.sleep(AIRBLOW_TRAVEL_DELAY)
+            
+        print("[AIRBLOW] Pneumatic Valve Relay ON (Buga ng Hangin)...")
+        # I-ON ang relay (Magpapadala ng HIGH/3.3V signal para mag-trigger sa H mode)
+        AIRBLOW.on()
+        
+        time.sleep(duration)
+        
+        # I-OFF ang relay (Magpapadala ng LOW/0V signal)
+        AIRBLOW.off()
+        print("[AIRBLOW] Pneumatic Valve Relay OFF (Hinto).")
+        
+    except Exception as e:
+        AIRBLOW.off()
+        print(f"[AIRBLOW ERROR] {e}")
+
+# =============================================================
+# MAIN RUNTIME LOOP
+# =============================================================
+if __name__ == "__main__":
+    print("=" * 60)
+    print("        LED360 PNEUMATIC AIRBLOW NOZZLE TESTING CORE        ")
+    print("=" * 60)
+    print(f"Hardware Setup:")
+    print(f"  - Airblow Relay Control Pin : GPIO {AIRBLOW_PIN} (High-Level Mode)")
+    print(f"  - Travel Delay Time         : {AIRBLOW_TRAVEL_DELAY}s")
+    print(f"  - Airblow Valve Pulse Time  : {AIRBLOW_DURATION}s")
+    print("-" * 60)
+    print("Testing Options:")
+    print("  -> Press ENTER to manually TRIGGER the Airblow Valve")
+    print("  -> Type 'q' and press Enter to exit the test code")
+    print("=" * 60 + "\n")
+    print("System Ready and Monitoring...")
+
+    try:
+        while True:
+            sys.stdout.write("\r[READY] Press ENTER to blow air (or 'q' to quit)... ")
+            sys.stdout.flush()
+
+            # Non-blocking check para sa console input
+            time.sleep(0.05)
+            if select.select([sys.stdin], [], [], 0)[0]:
+                line = sys.stdin.readline().strip().lower()
+
+                if line == 'q':
+                    break
+                else:
+                    print("\n[COMMAND] Manual airblow trigger received.")
+                    trigger_airblow(AIRBLOW_DURATION)
+                    print()  # Magdagdag ng bagong linya para sa formatting
+
+    except KeyboardInterrupt:
+        print("\n[SYSTEM] Testing interrupted by keyboard break.")
+
+    finally:
+        print("\n[CLEANUP] Ensuring GPIO 18 is safe and turned OFF...")
+        # Siguraduhing ligtas na naka-OFF (LOW/0V) ang pin bago mag-close ang program
+        AIRBLOW.off()
+        AIRBLOW.close()
+        print("Program Closed")
+
+
+import time
+import threading
+from flask import Flask, jsonify
+from gpiozero import OutputDevice
+
+# =============================================================
+# RUN THIS SCRIPT ON PI5 -- the "Actuator/Receiver Pi", the Raspberry
+# Pi 4/5 that is physically wired to the relay module + solenoid valve.
+#
+# PI5 IS THE MAIN SERVER: it waits for PI4 (the camera/YOLO Pi) to
+# tell it "NG box is full" over the network, THEN it fires the
+# relay/solenoid itself.
+#
+# Install requirements first (on THIS Pi):
+#   pip install flask --break-system-packages
+#
+# Find this Pi's IP address (run on THIS Pi):
+#   hostname -I
+#
+# Then use that IP address in the client script that runs on PI4
+# (see pi4_ng_box_client.py).
+# =============================================================
+
+NG_BOX_PIN          = 25   # BCM numbering, physical/board pin 22
+NG_BOX_RELEASE_TIME = 3.0  # seconds the solenoid stays open
+
+# Inayos para sa High-Level Trigger (Jumper sa H)
+# active_high=True -> Standard Logic (ON = HIGH, OFF = LOW)
+# initial_value=False -> Magsisimula ang pin sa LOW (0V) para siguradong OFF ang relay.
+NG_BOX_SOLENOID = OutputDevice(
+    NG_BOX_PIN,
+    active_high=True,   # High-level trigger relay module (Jumper sa H)
+    initial_value=False # Magsisimula sa OFF state (Pin status: LOW / 0V)
+)
+NG_BOX_SOLENOID.off()
+
+ng_box_count     = 0   # Pi5's own mirrored counter (for local display/logging)
+ng_box_releasing = False
+ng_box_lock = threading.Lock()
+
+app = Flask(__name__)
+
+
+@app.route("/trigger_ng_box", methods=["POST"])
+def trigger_ng_box():
+    """PI4 calls this when its NG count hits the limit. This runs the
+    FULL extend -> hold 3s -> retract cycle synchronously (blocking
+    this request) so PI4 only gets a response once the cycle is
+    genuinely complete -- that's the signal for BOTH Pis to reset
+    their counters to 0."""
+    global ng_box_count, ng_box_releasing
+
+    with ng_box_lock:
+        if ng_box_releasing:
+            return jsonify({"status": "already_releasing", "reset": False}), 200
+        ng_box_releasing = True
+
+    print("\n===================================================")
+    print("[NG BOX] Trigger received from PI4. Opening trap door...")
+    print("===================================================\n")
+
+    try:
+        # I-ON ang relay (Magpapadala ng HIGH/3.3V signal para mag-trigger sa H mode)
+        NG_BOX_SOLENOID.on()
+        print(f"[NG BOX] Solenoid EXTENDED. Holding for {NG_BOX_RELEASE_TIME}s...")
+        time.sleep(NG_BOX_RELEASE_TIME)
+        
+        # I-OFF ang relay (Magpapadala ng LOW/0V signal)
+        NG_BOX_SOLENOID.off()
+        print("[NG BOX] Solenoid RETRACTED.")
+    except Exception as e:
+        NG_BOX_SOLENOID.off()
+        print(f"[NG BOX ERROR] {e}")
+        with ng_box_lock:
+            ng_box_releasing = False
+        return jsonify({"status": "error", "message": str(e), "reset": False}), 500
+
+    with ng_box_lock:
+        ng_box_count     = 0   # PI5 resets its own mirrored counter
+        ng_box_releasing = False
+
+    print("[NG BOX] Trap door closed. Both counters can now reset to 0.\n")
+
+    # "reset": True tells PI4 the cycle is genuinely finished -- PI4
+    # should reset ITS counter to 0 only after seeing this.
+    return jsonify({"status": "done", "reset": True}), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "releasing": ng_box_releasing, "ng_box_count": ng_box_count}), 200
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("      PI5 -- NG BOX ACTUATOR SERVER (GPIO25)")
+    print("=" * 60)
+    print(f"GPIO (BCM)     : {NG_BOX_PIN} (High-Level Trigger Mode)")
+    print(f"Release Time   : {NG_BOX_RELEASE_TIME}s")
+    print("Listening on all interfaces, port 5000...")
+    print("=" * 60)
+
+    try:
+        # host="0.0.0.0" makes this reachable from PI4 on the LAN
+        # threaded=True lets /health respond even while a release is running
+        app.run(host="0.0.0.0", port=5000, threaded=True)
+    finally:
+        # Siguraduhing ligtas na ibabalik sa LOW (OFF) bago mag-close ang server
+        NG_BOX_SOLENOID.off()
+        print("GPIO released.")
+
+
+import sys
+import time
+import select
+from gpiozero import OutputDevice
+
+# =============================================================
+# 1. HARDWARE & BATCH CONFIGURATION
+# =============================================================
+BATCH_TRIGGER_PIN = 24
+
+# Inayos para sa High-Level Trigger (Jumper sa H)
+# active_high=True -> Standard Logic (ON = HIGH, OFF = LOW)
+# initial_value=False -> Magsisimula ang pin sa LOW (0V) para siguradong OFF ang relay.
+BATCH_TRIGGER = OutputDevice(
+    BATCH_TRIGGER_PIN,
+    active_high=True,      # High-level trigger relay module (Jumper sa H)
+    initial_value=False    # Magsisimula sa OFF state (Pin status: LOW / 0V)
+)
+
+TRIGGER_PULSE = 0.30
+batch_alarm_active = False
+
+# Tracking para sa product tracking logic
+product_count = 0
+TARGET_COUNT = 1000
+
+# =============================================================
+# 2. ALARM CONTROL LOGIC
+# =============================================================
+def trigger_batch_alarm():
+    global batch_alarm_active
+
+    if batch_alarm_active: 
+        print("Batch alarm already active.")
+        return
+
+    batch_alarm_active = True
+
+    print("\n" + "*"*60)
+    print("1000 PCS TARGET REACHED")
+    print("Triggering MY4GS Relay...")
+    print("*"*60 + "\n")
+
+    try:
+        # I-ON ang relay (Magpapadala ng HIGH/3.3V signal para mag-trigger sa H mode)
+        BATCH_TRIGGER.on()
+        
+        time.sleep(TRIGGER_PULSE)
+        
+        # I-OFF ang relay (Magpapadala ng LOW/0V signal)
+        BATCH_TRIGGER.off()
+
+        print("Trigger pulse sent.")
+        print("Waiting for operator reset.")
+
+    except Exception as e:
+        BATCH_TRIGGER.off()
+        print(e)
+
+def reset_batch_system():
+    global batch_alarm_active, product_count
+    print("\n[RESET] Operator reset received. Resetting batch counter to 0/1000...")
+    product_count = 0
+    batch_alarm_active = False
+
+# =============================================================
+# 3. MAIN TESTING RUNTIME LOOP
+# =============================================================
+if __name__ == "__main__":
+    print("="*60)
+    print("         LED360 PRODUCT BATCH COUNTER TESTING CORE          ")
+    print("="*60)
+    print(f"Hardware Setup:")
+    print(f"  - MY4GS Relay Control Pin : GPIO {BATCH_TRIGGER_PIN} (High-Level Trigger Mode)")
+    print(f"  - Output Relay Pulse Time : {TRIGGER_PULSE}s")
+    print("-"*60)
+    print("Testing Options:")
+    print("  -> Press ENTER to simulate a GOOD PRODUCT passing (+1 Count)")
+    print("  -> Type 'b' and press Enter to INSTANTLY FORCED 1000 PCS")
+    print("  -> Type 'q' and press Enter to exit the test code")
+    print("="*60 + "\n")
+    print("System Ready")
+
+    try:
+        while True:
+            # I-display ang real-time counter status sa console terminal
+            if not batch_alarm_active:
+                sys.stdout.write(f"\r[MONITORING] Good Products Counted: {product_count}/{TARGET_COUNT} ")
+            else:
+                sys.stdout.write(f"\r[BATCH DONE] Target achieved! Press ENTER to reset... ")
+            sys.stdout.flush()
+
+            # Non-blocking check para sa console input execution
+            time.sleep(0.05)
+            if select.select([sys.stdin], [], [], 0)[0]:
+                line = sys.stdin.readline().strip().lower()
+
+                if line == 'q':
+                    # Mag-exit sa program kapag 'q' ang pinindot
+                    break
+
+                elif line == 'b':
+                    # Shortcut command para piliting mag-1000 pcs agad para sa testing ng buzzer
+                    print("\n[SIMULATION] Forcing counter to 1000 pcs...")
+                    product_count = TARGET_COUNT
+                    trigger_batch_alarm()
+
+                else:
+                    # Kung normal na Enter key lang ang pinindot
+                    if not batch_alarm_active:
+                        product_count += 1
+                        print(f"\n[SENSOR] Good product registered. Current Count: {product_count}/{TARGET_COUNT}")
+                        
+                        # Suriin kung naabot na ang 1000 limit
+                        if product_count >= TARGET_COUNT:
+                            trigger_batch_alarm()
+                    else:
+                        # Kung kasalukuyang active ang batch alarm at pinindot ang Enter, mag-re-reset ito
+                        reset_batch_system()
+
+    except KeyboardInterrupt:
+        print("\n[SYSTEM] Testing interrupted by keyboard break.")
+
+    finally:
+        print("\n[CLEANUP] Ensuring GPIO 24 is safe and unlatched...")
+        # Siguraduhing ligtas na naka-OFF (LOW/0V) ang pin bago mag-close ang program
+        BATCH_TRIGGER.off()
+        BATCH_TRIGGER.close()
+        print("Program Closed")
+
+
+import sys
+import time
+from gpiozero import OutputDevice
+
+# =============================================================
+# CONFIGURATION
+# =============================================================
+
+STALL_THRESHOLD = 30.0
+
+# GPIO16
+TRIGGER_PIN = 16
+
+# Pulse width to trigger MY4GS latch
+TRIGGER_PULSE = 0.30      # 300 ms
+
+# Dahil inilipat natin sa "H" (High-Level Trigger) ang jumper ng relay:
+# active_high=True -> Standard Logic (ON = HIGH, OFF = LOW)
+# initial_value=False -> Magsisimula ang pin sa LOW (0V) para siguradong OFF ang relay.
+trigger = OutputDevice(
+    TRIGGER_PIN,
+    active_high=True,      # High-level trigger relay module (Jumper sa H)
+    initial_value=False    # Magsisimula sa OFF/Inactive state (Pin status: LOW / 0V)
+)
+
+# Tiyakin na ang relay ay OFF sa simula
+trigger.off()
+
+# =============================================================
+# VARIABLES
+# =============================================================
+
+last_product_time = time.time()
+
+# Prevent repeated triggering while waiting for RESET
+alarm_sent = False
+
+# =============================================================
+# PRODUCT DETECTED
+# Call this function from your YOLO code
+# =============================================================
+
+def product_detected():
+    global last_product_time
+    global alarm_sent
+
+    last_product_time = time.time()
+
+    # Machine has resumed production
+    alarm_sent = False
+
+# =============================================================
+# SEND ONE TRIGGER PULSE
+# =============================================================
+
+def trigger_alarm():
+
+    print("\n=================================================")
+    print("30 SECOND TIMEOUT")
+    print("Sending trigger pulse to MY4GS...")
+    print("=================================================\n")
+
+    # I-ON ang relay (Magpapadala ng HIGH/3.3V signal para mag-trigger sa H mode)
+    trigger.on()
+
+    time.sleep(TRIGGER_PULSE)
+
+    # I-OFF ang relay (Magpapadala ng LOW/0V signal)
+    trigger.off()
+
+    print("Trigger complete.\n")
+
+# =============================================================
+# MAIN
+# =============================================================
+
+if __name__ == "__main__":
+
+    print("=" * 60)
+    print("      30-SECOND STALL MONITOR (HIGH-LEVEL TRIGGER)")
+    print("=" * 60)
+    print(f"GPIO           : {TRIGGER_PIN}")
+    print(f"Timeout        : {STALL_THRESHOLD} sec")
+    print(f"Trigger Pulse  : {TRIGGER_PULSE:.2f} sec")
+    print("=" * 60)
+
+    try:
+
+        while True:
+
+            elapsed = time.time() - last_product_time
+            remaining = max(0.0, STALL_THRESHOLD - elapsed)
+
+            sys.stdout.write(
+                f"\rWaiting for product... {remaining:4.1f}s"
+            )
+
+            sys.stdout.flush()
+
+            if (not alarm_sent) and elapsed >= STALL_THRESHOLD:
+
+                trigger_alarm()
+
+                alarm_sent = True
+
+            time.sleep(0.1)
+
+    except KeyboardInterrupt:
+
+        print("\nProgram stopped.")
+
+    finally:
+
+        # Siguraduhing ligtas na naka-OFF (LOW) ang relay pagka-exit ng script
+        trigger.off()
+
+        print("GPIO released.")
